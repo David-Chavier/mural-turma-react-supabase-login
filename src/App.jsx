@@ -54,7 +54,10 @@ export default function App() {
     // Verifica sessão salva no browser ao abrir o app
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUsuario(session?.user ?? null)
-      if (session?.user) buscarPosts()
+      // Passamos session.user direto para buscarPosts.
+      // Importante: setUsuario é assíncrono — o estado `usuario` ainda é null
+      // neste exato momento. Por isso NÃO podemos depender dele aqui dentro.
+      if (session?.user) buscarPosts(session.user)
       else setCarregando(false)
     })
 
@@ -63,7 +66,7 @@ export default function App() {
       (_event, session) => {
         setUsuario(session?.user ?? null)
         if (session?.user) {
-          buscarPosts()
+          buscarPosts(session.user)
         } else {
           setPosts([])
           setCarregando(false)
@@ -81,7 +84,10 @@ export default function App() {
   }
 
   // ─── Posts ────────────────────────────────────────────────────────────────
-  async function buscarPosts() {
+  // Recebe `usuarioAtual` como parâmetro (com fallback para o estado `usuario`).
+  // Quem chama logo após o login passa session.user diretamente, porque o
+  // estado `usuario` ainda não foi atualizado nesse instante.
+  async function buscarPosts(usuarioAtual = usuario) {
     setCarregando(true)
     setErro(null)
 
@@ -107,7 +113,7 @@ export default function App() {
     const { data: minhasCurtidas } = await supabase
       .from('curtidas')
       .select('post_id')
-      .eq('user_id', usuario.id)
+      .eq('user_id', usuarioAtual.id)
 
     const idsCurtidos = new Set((minhasCurtidas ?? []).map(c => c.post_id))
 
