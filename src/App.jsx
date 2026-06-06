@@ -22,15 +22,24 @@ import ListaDePosts from './components/ListaDePosts'
 // o listener cuida disso e atualiza o estado React automaticamente.
 // ---------------------------------------------------------------------------
 
-function mapearPost(postDoBanco) {
+// Converte um registro do banco para o formato do React.
+// `idsCurtidosPeloUsuario` é um Set com os IDs dos posts que o usuário logado curtiu.
+//
+// Sobre as curtidas:
+//   - O total NÃO vem mais de uma coluna na tabela posts.
+//   - Vem CONTADO da tabela 'curtidas' via agregação: select('*, curtidas(count)')
+//   - O Supabase retorna isso como um array: postDoBanco.curtidas = [{ count: 5 }]
+//   - Por isso lemos postDoBanco.curtidas[0]?.count
+function mapearPost(postDoBanco, idsCurtidosPeloUsuario) {
   return {
-    id:        postDoBanco.id,
-    userId:    postDoBanco.user_id,     // UUID do dono do post (auth.users)
-    autor:     postDoBanco.autor,
-    conteudo:  postDoBanco.conteudo,
-    imagemUrl: postDoBanco.imagem_url,
-    curtidas:  postDoBanco.curtidas,
-    criadoEm:  new Date(postDoBanco.criado_em),
+    id:         postDoBanco.id,
+    userId:     postDoBanco.user_id,
+    autor:      postDoBanco.autor,
+    conteudo:   postDoBanco.conteudo,
+    imagemUrl:  postDoBanco.imagem_url,
+    curtidas:   postDoBanco.curtidas[0]?.count ?? 0,      // total de curtidas (contado)
+    euCurti:    idsCurtidosPeloUsuario.has(postDoBanco.id), // o usuário atual curtiu?
+    criadoEm:   new Date(postDoBanco.criado_em),
   }
 }
 
@@ -76,17 +85,34 @@ export default function App() {
     setCarregando(true)
     setErro(null)
 
-    const { data, error } = await supabase
+    // Passo 1: busca os posts JÁ com a contagem de curtidas.
+    // 'curtidas(count)' é uma agregação: o Supabase conta quantas linhas
+    // da tabela 'curtidas' apontam para cada post. Funciona porque criamos
+    // a foreign key curtidas.post_id → posts.id.
+    const { data: dadosPosts, error: erroPosts } = await supabase
       .from('posts')
-      .select('*')
+      .select('*, curtidas(count)')
       .order('criado_em', { ascending: false })
 
-    if (error) {
+    if (erroPosts) {
       setErro('Não foi possível carregar os posts.')
-      console.error(error)
-    } else {
-      setPosts(data.map(mapearPost))
+      console.error(erroPosts)
+      setCarregando(false)
+      return
     }
+
+    // Passo 2: descobre quais posts ESTE usuário já curtiu.
+    // Buscamos só as curtidas dele e montamos um Set com os post_id.
+    // Set permite checar "este post está curtido?" de forma rápida (.has()).
+    const { data: minhasCurtidas } = await supabase
+      .from('curtidas')
+      .select('post_id')
+      .eq('user_id', usuario.id)
+
+    const idsCurtidos = new Set((minhasCurtidas ?? []).map(c => c.post_id))
+
+    // Passo 3: mapeia cada post, marcando se o usuário curtiu
+    setPosts(dadosPosts.map(p => mapearPost(p, idsCurtidos)))
     setCarregando(false)
   }
 
@@ -102,28 +128,58 @@ export default function App() {
         conteudo,
         imagem_url: imagemUrl || null,
       }])
-      .select()
+      .select('*, curtidas(count)')     // já traz a contagem (zero) no formato esperado
       .single()
 
-    if (!error) setPosts([mapearPost(data), ...posts])
-    else console.error('Erro ao criar post:', error)
+    if (!error) {
+      // Post novo: 0 curtidas e o usuário ainda não curtiu (Set vazio)
+      setPosts([mapearPost(data, new Set()), ...posts])
+    } else {
+      console.error('Erro ao criar post:', error)
+    }
   }
 
-  async function curtirPost(id) {
-    // Atualização otimista: atualiza a tela antes de esperar o banco
+  // ─── Curtir / descurtir (toggle) ────────────────────────────────────────────
+  // Agora cada curtida é uma LINHA na tabela 'curtidas' (post_id + user_id).
+  // A restrição UNIQUE(post_id, user_id) no banco garante 1 curtida por pessoa.
+  //
+  // Se o usuário já curtiu  → remove a linha (descurtir)
+  // Se ainda não curtiu     → insere a linha (curtir)
+  async function alternarCurtida(id) {
+    const post = posts.find(p => p.id === id)
+    const jaCurtiu = post.euCurti
+
+    // Atualização otimista: muda o coração e o número na hora
     setPosts(posts.map(p =>
-      p.id === id ? { ...p, curtidas: p.curtidas + 1 } : p
+      p.id === id
+        ? { ...p, euCurti: !jaCurtiu, curtidas: p.curtidas + (jaCurtiu ? -1 : 1) }
+        : p
     ))
-    const postAtual = posts.find(p => p.id === id)
-    const { error } = await supabase
-      .from('posts')
-      .update({ curtidas: postAtual.curtidas + 1 })
-      .eq('id', id)
+
+    let error
+    if (jaCurtiu) {
+      // Descurtir: apaga a linha deste usuário para este post
+      const res = await supabase
+        .from('curtidas')
+        .delete()
+        .eq('post_id', id)
+        .eq('user_id', usuario.id)
+      error = res.error
+    } else {
+      // Curtir: insere a linha (post_id + user_id)
+      const res = await supabase
+        .from('curtidas')
+        .insert([{ post_id: id, user_id: usuario.id }])
+      error = res.error
+    }
 
     if (error) {
-      console.error('Erro ao curtir:', error)
+      console.error('Erro ao curtir/descurtir:', error)
+      // Desfaz a atualização otimista em caso de erro
       setPosts(posts.map(p =>
-        p.id === id ? { ...p, curtidas: postAtual.curtidas } : p
+        p.id === id
+          ? { ...p, euCurti: jaCurtiu, curtidas: post.curtidas }
+          : p
       ))
     }
   }
@@ -198,7 +254,7 @@ export default function App() {
           posts={posts}
           carregando={carregando}
           usuarioId={usuario.id}
-          onCurtir={curtirPost}
+          onCurtir={alternarCurtida}
           onDeletar={deletarPost}
         />
       </main>

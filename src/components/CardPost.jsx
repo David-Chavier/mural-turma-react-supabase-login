@@ -30,7 +30,7 @@ function gerarCorAvatar(nomeAutor) {
 }
 
 export default function CardPost({ post, usuarioId, onCurtir, onDeletar }) {
-  const { id, userId, autor, conteudo, imagemUrl, curtidas, criadoEm } = post
+  const { id, userId, autor, conteudo, imagemUrl, curtidas, euCurti, criadoEm } = post
 
   // O dono do post pode deletar — os outros nem veem o botão
   const ehDono = usuarioId === userId
@@ -59,14 +59,26 @@ export default function CardPost({ post, usuarioId, onCurtir, onDeletar }) {
 
         <div className="flex items-center gap-3 pt-3 border-t border-gray-100">
 
-          {/* Qualquer um pode curtir */}
+          {/*
+            Botão curtir/descurtir.
+            euCurti = true  → coração VERMELHO PREENCHIDO (fill) + texto vermelho
+            euCurti = false → coração CINZA VAZADO (só contorno)
+
+            A diferença visual é controlada por duas coisas no SVG:
+              - fill: "currentColor" (preenche) vs "none" (vazado)
+              - a cor do texto/ícone via classes text-red-500 vs text-gray-500
+          */}
           <button onClick={() => onCurtir(id)}
-                  className="flex items-center gap-1.5 text-sm text-gray-500
-                             hover:text-indigo-600 transition-colors cursor-pointer group"
-                  aria-label={`Curtir post de ${autor}`}>
+                  className={`flex items-center gap-1.5 text-sm transition-colors
+                              cursor-pointer group
+                              ${euCurti
+                                ? 'text-red-500'
+                                : 'text-gray-500 hover:text-red-500'}`}
+                  aria-label={euCurti ? `Descurtir post de ${autor}` : `Curtir post de ${autor}`}>
             <svg xmlns="http://www.w3.org/2000/svg"
                  className="w-5 h-5 group-hover:scale-110 transition-transform"
-                 fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                 fill={euCurti ? 'currentColor' : 'none'}
+                 viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round"
                     d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682
                        a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318

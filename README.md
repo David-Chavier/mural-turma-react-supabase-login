@@ -23,40 +23,79 @@ Em ambiente de aula isso trava tudo. Desative assim:
 
 **Supabase → Authentication → Providers → Email → desmarque "Confirm email" → Save**
 
-### 2. Crie a tabela no Supabase
+### 2. Crie as tabelas no Supabase
 
 Cole no **SQL Editor**:
 
 ```sql
+-- ── Tabela de posts ──────────────────────────────────────────────
 CREATE TABLE posts (
   id         SERIAL PRIMARY KEY,
   user_id    UUID NOT NULL REFERENCES auth.users(id),
   autor      VARCHAR(50)  NOT NULL,
   conteudo   TEXT         NOT NULL CHECK (char_length(conteudo) <= 280),
   imagem_url TEXT,
-  curtidas   INTEGER      DEFAULT 0,
   criado_em  TIMESTAMP    DEFAULT NOW()
 );
+-- Nota: NÃO existe mais a coluna "curtidas" aqui.
+-- O total de curtidas é CONTADO a partir da tabela abaixo.
 
-ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+-- ── Tabela de curtidas ───────────────────────────────────────────
+-- Cada curtida é uma linha que liga UM post a UM usuário.
+CREATE TABLE curtidas (
+  id        SERIAL PRIMARY KEY,
+  post_id   INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id   UUID    NOT NULL REFERENCES auth.users(id),
+  criado_em TIMESTAMP DEFAULT NOW(),
 
--- Qualquer um lê
+  -- A MÁGICA: cada usuário só pode curtir cada post uma vez.
+  -- Se tentar curtir de novo, o banco recusa com erro de duplicata.
+  UNIQUE (post_id, user_id)
+);
+-- ON DELETE CASCADE: se o post for apagado, suas curtidas somem junto.
+
+-- ── Segurança (RLS) ──────────────────────────────────────────────
+ALTER TABLE posts    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE curtidas ENABLE ROW LEVEL SECURITY;
+
+-- Posts: qualquer um lê
 CREATE POLICY "leitura publica"
   ON posts FOR SELECT USING (true);
 
--- Só usuários logados criam (e só para o próprio user_id)
+-- Posts: só usuários logados criam (e só para o próprio user_id)
 CREATE POLICY "criacao autenticada"
   ON posts FOR INSERT TO authenticated
   WITH CHECK (auth.uid() = user_id);
 
--- Qualquer um pode curtir
-CREATE POLICY "curtida publica"
-  ON posts FOR UPDATE USING (true);
-
--- Só o dono deleta o próprio post
+-- Posts: só o dono deleta o próprio post
 CREATE POLICY "exclusao do dono"
   ON posts FOR DELETE USING (auth.uid() = user_id);
+
+-- Curtidas: qualquer um lê (para contar o total)
+CREATE POLICY "curtidas leitura publica"
+  ON curtidas FOR SELECT USING (true);
+
+-- Curtidas: usuário logado só insere curtida em SEU próprio nome
+CREATE POLICY "curtir autenticado"
+  ON curtidas FOR INSERT TO authenticated
+  WITH CHECK (auth.uid() = user_id);
+
+-- Curtidas: usuário só remove a PRÓPRIA curtida (descurtir)
+CREATE POLICY "descurtir proprio"
+  ON curtidas FOR DELETE USING (auth.uid() = user_id);
 ```
+
+### Como funcionam as curtidas agora
+
+| Antes | Agora |
+|---|---|
+| Coluna `curtidas` (número) na tabela posts | Tabela `curtidas` com 1 linha por curtida |
+| Qualquer um curtia infinitas vezes | `UNIQUE(post_id, user_id)` = 1 por pessoa |
+| Não sabia quem curtiu | Cada curtida tem o `user_id` |
+| Coração sempre cinza | Coração fica 🔴 vermelho se você curtiu |
+
+**Curtir** = inserir uma linha. **Descurtir** = apagar a linha.
+O total é `COUNT(*)` das linhas daquele post.
 
 ### 3. Crie o bucket de imagens
 
@@ -140,15 +179,28 @@ CREATE TABLE posts (
   autor      VARCHAR(50)  NOT NULL,
   conteudo   TEXT         NOT NULL CHECK (char_length(conteudo) <= 280),
   imagem_url TEXT,
-  curtidas   INTEGER      DEFAULT 0,
   criado_em  TIMESTAMP    DEFAULT NOW()
 );
+-- SEM coluna curtidas: o total é contado da tabela curtidas
 
-ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+CREATE TABLE curtidas (
+  id        SERIAL PRIMARY KEY,
+  post_id   INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id   UUID    NOT NULL REFERENCES auth.users(id),
+  criado_em TIMESTAMP DEFAULT NOW(),
+  UNIQUE (post_id, user_id)   -- 1 curtida por usuário por post
+);
+
+ALTER TABLE posts    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE curtidas ENABLE ROW LEVEL SECURITY;
+
 CREATE POLICY "leitura publica"     ON posts FOR SELECT USING (true);
 CREATE POLICY "criacao autenticada" ON posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);
-CREATE POLICY "curtida publica"     ON posts FOR UPDATE USING (true);
 CREATE POLICY "exclusao do dono"    ON posts FOR DELETE USING (auth.uid() = user_id);
+
+CREATE POLICY "curtidas leitura publica" ON curtidas FOR SELECT USING (true);
+CREATE POLICY "curtir autenticado"       ON curtidas FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "descurtir proprio"        ON curtidas FOR DELETE USING (auth.uid() = user_id);
 
 ─── src/lib/supabase.js ─────────────────────────────────────────────────────
 
@@ -194,26 +246,45 @@ useEffect para autenticação:
   Comentário explicando: onAuthStateChange é como um "addEventListener" para o estado de login.
   O cleanup (unsubscribe) evita memory leaks.
 
-Função mapearPost(postDoBanco):
+Função mapearPost(postDoBanco, idsCurtidosPeloUsuario):
+  idsCurtidosPeloUsuario = Set com os post_id que o usuário logado curtiu
   { id, userId: postDoBanco.user_id, autor, conteudo,
-    imagemUrl: postDoBanco.imagem_url, curtidas,
+    imagemUrl: postDoBanco.imagem_url,
+    curtidas: postDoBanco.curtidas[0]?.count ?? 0,   // total CONTADO via agregação
+    euCurti: idsCurtidosPeloUsuario.has(postDoBanco.id), // este usuário curtiu?
     criadoEm: new Date(postDoBanco.criado_em) }
 
 Funções assíncronas:
-  buscarPosts(): mesmo que a versão sem login
+  buscarPosts():
+    1. Busca posts com contagem de curtidas:
+       supabase.from('posts').select('*, curtidas(count)').order('criado_em', {ascending:false})
+       (curtidas(count) é uma agregação — conta as linhas da tabela curtidas por post)
+    2. Busca as curtidas DESTE usuário:
+       supabase.from('curtidas').select('post_id').eq('user_id', usuario.id)
+       Monta um Set com os post_id → idsCurtidos
+    3. setPosts(dados.map(p => mapearPost(p, idsCurtidos)))
 
   criarPost({ conteudo, imagemUrl }):
-    Nota: autor não vem do formulário, vem do usuário logado.
     autor = usuario.user_metadata?.nome_exibicao ?? usuario.email
     await supabase.from('posts')
       .insert([{ user_id: usuario.id, autor, conteudo, imagem_url: imagemUrl || null }])
-      .select().single()
+      .select('*, curtidas(count)').single()
+    setPosts([mapearPost(data, new Set()), ...posts])  // novo post: 0 curtidas, não curtido
 
-  curtirPost(id): mesmo que a versão sem login (atualização otimista)
+  alternarCurtida(id):   ← antes era curtirPost
+    post = posts.find(p => p.id === id); jaCurtiu = post.euCurti
+    Atualização otimista: alterna euCurti e soma/subtrai 1 em curtidas
+    Se jaCurtiu (descurtir):
+      supabase.from('curtidas').delete().eq('post_id', id).eq('user_id', usuario.id)
+    Senão (curtir):
+      supabase.from('curtidas').insert([{ post_id: id, user_id: usuario.id }])
+    Em caso de erro: desfaz a atualização otimista
+    Comentário: a restrição UNIQUE no banco é a garantia final de 1 curtida por pessoa.
 
   deletarPost(id):
     setPosts(posts.filter(p => p.id !== id))  // otimista
     await supabase.from('posts').delete().eq('id', id)
+    (as curtidas do post somem sozinhas por causa do ON DELETE CASCADE)
 
   async sair():
     await supabase.auth.signOut()
@@ -301,10 +372,17 @@ Skeleton de loading: idêntico à versão sem login.
 ─── src/components/CardPost.jsx ─────────────────────────────────────────────
 
 Props: { post, usuarioId, onCurtir, onDeletar }
-Desestrutura post: { id, userId, autor, conteudo, imagemUrl, curtidas, criadoEm }
+Desestrutura post: { id, userId, autor, conteudo, imagemUrl, curtidas, euCurti, criadoEm }
 
-Diferença da versão sem login:
-  O botão "Deletar" só aparece se usuarioId === post.userId:
+Botão curtir (estilo Instagram):
+  euCurti = true  → coração VERMELHO PREENCHIDO + texto text-red-500
+  euCurti = false → coração CINZA VAZADO, hover vermelho
+  No SVG: fill={euCurti ? 'currentColor' : 'none'}
+  Na classe: euCurti ? 'text-red-500' : 'text-gray-500 hover:text-red-500'
+  onClick={() => onCurtir(id)}  // a função alterna curtir/descurtir
+  aria-label muda entre "Curtir" e "Descurtir"
+
+Botão "Deletar" só aparece se usuarioId === post.userId:
   {usuarioId === userId && (
     <button onClick={() => onDeletar(id)}>Deletar</button>
   )}
